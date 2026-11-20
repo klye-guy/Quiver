@@ -1,0 +1,187 @@
+# Build, test and release quiver.
+#
+#   pull request  -> unit tests + Secure Boot boot test
+#   push to main  -> the same, then a GitHub release with binaries for
+#                    Linux and Windows (amd64, arm64), the source tarball,
+#                    SHA256SUMS, BUILDINFO.txt and signed build provenance.
+#
+# Version numbers: `var version` in cmd/quiver/main.go is the base. If no
+# tag v<base> exists yet, the release is v<base>. Otherwise the patch number
+# continues from the highest existing v<major>.<minor>.* tag. Bump the base
+# in the source to start a new minor or major series.
+#
+# Third-party actions are pinned to full commit SHAs (tag in the comment).
+
+name: release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.24.7"
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Install the tools the tests cross-check against
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            dosfstools gdisk mtools xorriso genisoimage wimtools exfatprogs
+
+      - name: Fetch Ubuntu's signed shim for the Authenticode tests
+        run: |
+          mkdir -p "$RUNNER_TEMP/shim" && cd "$RUNNER_TEMP/shim"
+          apt-get download shim-signed
+          dpkg-deb -x shim-signed_*.deb x
+          echo "QUIVER_TEST_SHIM=$RUNNER_TEMP/shim/x/usr/lib/shim/shimx64.efi.signed.latest" >> "$GITHUB_ENV"
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "not gofmt-formatted:"; echo "$out"; exit 1; fi
+
+      - name: go vet (linux, windows)
+        run: |
+          go vet ./...
+          GOOS=windows go vet ./...
+
+      - name: go test
+        run: go test -count=1 ./...
+
+  secureboot:
+    name: Secure Boot boot test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Install QEMU, OVMF and image tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            qemu-system-x86 ovmf xorriso mtools
+
+      - name: Allow KVM (falls back to emulation if absent)
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+              | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+          fi
+
+      - name: Boot test sticks under OVMF Secure Boot
+        run: |
+          go build -trimpath -o "$RUNNER_TEMP/quiver" ./cmd/quiver
+          QUIVER="$RUNNER_TEMP/quiver" ./test/secureboot-e2e.sh
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, secureboot]
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    permissions:
+      contents: write     # create the tag and release
+      id-token: write     # sign build provenance
+      attestations: write # store build provenance
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # tags are needed to pick the next version
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Choose version
+        id: version
+        run: |
+          if existing=$(git tag --points-at HEAD --list 'v*' | head -1) && [ -n "$existing" ]; then
+            echo "This commit is already released as $existing; nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          base=$(sed -n 's/^var version = "\([0-9]*\.[0-9]*\.[0-9]*\)"$/\1/p' cmd/quiver/main.go)
+          [ -n "$base" ] || { echo "could not read var version from cmd/quiver/main.go"; exit 1; }
+          if ! git rev-parse -q --verify "refs/tags/v$base" >/dev/null; then
+            ver=$base
+          else
+            mm=${base%.*}
+            last=$(git tag --list "v$mm.*" | sed "s/^v$mm\.//" | grep -E '^[0-9]+$' | sort -n | tail -1)
+            ver="$mm.$((last + 1))"
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "Releasing v$ver (base $base)"
+
+      - name: Build release artifacts
+        if: steps.version.outputs.skip != 'true'
+        env:
+          VER: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir dist
+          for t in linux/amd64 linux/arm64 windows/amd64 windows/arm64; do
+            os=${t%/*}; arch=${t#*/}; ext=; [ "$os" = windows ] && ext=.exe
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch \
+              go build -trimpath -ldflags "-s -w -buildid= -X main.version=$VER" \
+              -o "dist/quiver-$os-$arch$ext" ./cmd/quiver
+          done
+          ./dist/quiver-linux-amd64 version | grep -qx "quiver $VER"
+          git archive --format=tar.gz --prefix="quiver-$VER/" -o "dist/quiver-$VER-source.tar.gz" HEAD
+          cp README.md dist/
+          {
+            echo "quiver $VER"
+            echo "commit: $GITHUB_SHA"
+            echo "built with: $(go version)"
+            echo "command: CGO_ENABLED=0 GOOS=<os> GOARCH=<arch> go build -trimpath -ldflags \"-s -w -buildid= -X main.version=$VER\" ./cmd/quiver"
+          } > dist/BUILDINFO.txt
+          (cd dist && sha256sum quiver-* BUILDINFO.txt README.md > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Sign build provenance
+        if: steps.version.outputs.skip != 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/quiver-*
+            dist/SHA256SUMS
+
+      - name: Publish release
+        if: steps.version.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VER: ${{ steps.version.outputs.version }}
+        run: |
+          cat > notes.md <<EOF
+          Built from commit $GITHUB_SHA by [this workflow run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID), after the unit tests and the QEMU Secure Boot boot test passed.
+
+          **Verify a download**
+          \`\`\`
+          sha256sum -c SHA256SUMS --ignore-missing
+          gh attestation verify quiver-linux-amd64 --repo $GITHUB_REPOSITORY
+          \`\`\`
+          To rebuild byte-for-byte, use the Go version and command in BUILDINFO.txt.
+          EOF
+          gh release create "v$VER" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "quiver $VER" \
+            --notes-file notes.md \
+            --generate-notes
